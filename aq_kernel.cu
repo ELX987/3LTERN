@@ -1,103 +1,97 @@
-#include <cuda_bf16.h>
+
+#include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <cstdint>
 
-// =========================================================================
-// 1. THE GPU KERNEL (BFloat16 & Blackwell Optimized)
-// =========================================================================
-__global__ void fused_aq_gemm_kernel(
-    const int* __restrict__ indices,
-    const __nv_bfloat16* __restrict__ codebooks,
-    const __nv_bfloat16* __restrict__ inputs,
-    __nv_bfloat16* __restrict__ outputs,
-    int num_tokens,
-    int in_features,
+__global__ void fused_aq_packed_kernel(
+    const uint8_t* __restrict__ packed_indices,
+    const half* __restrict__ codebooks,
+    const half* __restrict__ inputs,
+    half* __restrict__ outputs,
+    int num_codebooks, 
+    int dict_size,     
+    int in_features,   
     int out_features,
-    int num_codebooks,
-    int dict_size,
-    int vector_dim
+    int stride, 
+    int total_codebook_elements,
+    int num_tokens
 ) {
-    extern __shared__ __nv_bfloat16 shared_codebooks[]; 
-    
-    int tid = threadIdx.x; 
-    int total_cb_elements = num_codebooks * dict_size * vector_dim;
+    extern __shared__ half shared_data[];
+    half* shared_codebooks = shared_data;
+    // Offset by codebook size to create the LUT
+    int8_t* decode_lut = (int8_t*)&shared_data[total_codebook_elements];
 
-    // Load codebooks into ultra-fast L1 Shared Memory
-    for (int i = tid; i < total_cb_elements; i += blockDim.x) {
+    int tid = threadIdx.x;
+
+    // 1. Load Codebooks cooperatively
+    for (int i = tid; i < total_codebook_elements; i += blockDim.x) {
         shared_codebooks[i] = codebooks[i];
+    }
+    
+    // 🚨 FIX 1: Safe LUT Init (Works even if threads < 243)
+    for (int i = tid; i < 243; i += blockDim.x) {
+        uint8_t val = i;
+        #pragma unroll
+        for (int j = 0; j < 5; j++) {
+            decode_lut[i * 5 + j] = (int8_t)(val % 3) - 1;
+            val /= 3;
+        }
     }
     __syncthreads();
 
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_blocks = in_features / vector_dim;
+    // 2. Token & Row Mapping
+    int token_idx = blockIdx.x; 
+    int row = blockIdx.y * blockDim.x + threadIdx.x;
 
-    if (row < out_features) {
-        for (int t = 0; t < num_tokens; ++t) {
-            float sum = 0.0f; 
-            
-            for (int block = 0; block < num_blocks; ++block) {
-                for (int v = 0; v < vector_dim; ++v) {
-                    int col = block * vector_dim + v;
-                    float reconstructed_weight = 0.0f;
-                    
-                    for (int m = 0; m < num_codebooks; ++m) {
-                        int idx_offset = row * (num_blocks * num_codebooks) + block * num_codebooks + m;
-                        int dict_idx = indices[idx_offset];
-                        int cb_offset = m * (dict_size * vector_dim) + dict_idx * vector_dim + v;
+    if (row < out_features && token_idx < num_tokens) {
+        float total_sum = 0.0f;
+        
+        uint64_t row_offset = (uint64_t)row * stride * num_codebooks;
+        const half* my_input = inputs + ((uint64_t)token_idx * in_features);
+
+        for (int col_block = 0; col_block < stride; ++col_block) {
+            float weights5[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+            for (int m = 0; m < num_codebooks; ++m) {
+                uint8_t packed_byte = packed_indices[row_offset + (col_block * num_codebooks) + m];
+
+                 if (packed_byte < 243) {
+                    #pragma unroll
+                    for (int i = 0; i < 5; i++) {
+                        int8_t ternary_val = decode_lut[packed_byte * 5 + i];
                         
-                        reconstructed_weight += __bfloat162float(shared_codebooks[cb_offset]); 
+                        if (ternary_val != 0) {
+                            weights5[i] += __half2float(shared_codebooks[m * dict_size + ((ternary_val == -1) ? 0 : 1)]);
+                        }
                     }
-                    
-                    float input_val = __bfloat162float(inputs[t * in_features + col]);
-                    sum += reconstructed_weight * input_val;
                 }
             }
-            outputs[t * out_features + row] = __float2bfloat16(sum); 
+
+            #pragma unroll
+            for (int i = 0; i < 5; i++) {
+                int actual_col = col_block * 5 + i;
+                if (actual_col < in_features) {
+                    total_sum += weights5[i] * __half2float(my_input[actual_col]);
+                }
+            }
         }
+        outputs[(uint64_t)token_idx * out_features + row] = __float2half(total_sum);
     }
 }
 
-// =========================================================================
-// 2. THE PYTORCH C++ WRAPPER
-// =========================================================================
-torch::Tensor aq_gemm_forward(torch::Tensor indices, torch::Tensor codebooks, torch::Tensor inputs) {
-    int num_tokens = inputs.size(0);
-    int in_features = inputs.size(1);
-    int out_features = indices.size(0);
-    
-    int num_codebooks = codebooks.size(0);
-    int dict_size = codebooks.size(1);
-    int vector_dim = codebooks.size(2);
+void launch_aq_packed_kernel(
+    const uint8_t* indices, const at::Half* codebooks, const at::Half* inputs, at::Half* outputs,
+    int blocks_y,
+    int threads, int shared_mem_size,
+    int num_codebooks, int dict_size, int in_features, int out_features, int stride, 
+    int total_codebook_elements, int num_tokens
+) {
+    dim3 threads_per_block(threads);
+    dim3 grid(num_tokens, blocks_y); 
 
-    auto outputs = torch::empty({num_tokens, out_features}, inputs.options());
-
-    int threads = 256;
-    int blocks = (out_features + threads - 1) / threads;
-    
-    // Define the memory size needed for the hardware override
-    int shared_mem_bytes = num_codebooks * dict_size * vector_dim * sizeof(uint16_t);
-
-    // UNLOCK BLACKWELL SHARED MEMORY LIMIT
-    cudaFuncSetAttribute(
-        (const void*)fused_aq_gemm_kernel, 
-        cudaFuncAttributeMaxDynamicSharedMemorySize, 
-        shared_mem_bytes
+    fused_aq_packed_kernel<<<grid, threads_per_block, shared_mem_size>>>(
+        (const uint8_t*)indices, (const half*)codebooks, (const half*)inputs, (half*)outputs, 
+        num_codebooks, dict_size, in_features, out_features, stride, 
+        total_codebook_elements, num_tokens
     );
-
-    // Launch the kernel
-    fused_aq_gemm_kernel<<<blocks, threads, shared_mem_bytes>>>(
-        indices.data_ptr<int>(),
-        reinterpret_cast<__nv_bfloat16*>(codebooks.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(inputs.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(outputs.data_ptr<at::BFloat16>()),
-        num_tokens, in_features, out_features, num_codebooks, dict_size, vector_dim
-    );
-
-    return outputs;
-}
-
-// =========================================================================
-// 3. PYTHON BINDING
-// =========================================================================
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &aq_gemm_forward, "Fused AQ Forward Pass (BFloat16)");
 }
